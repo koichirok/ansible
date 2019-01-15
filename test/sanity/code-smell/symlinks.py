@@ -6,6 +6,7 @@ import os
 def main():
     skip_dirs = set([
         '.tox',
+        'venv',
     ])
 
     for root, dirs, files in os.walk('.'):
