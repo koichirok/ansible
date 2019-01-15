@@ -991,7 +991,9 @@ class FreeBsdService(Service):
 
         self.sysrc_cmd = self.module.get_bin_path('sysrc')
 
-        if self.module.params['jail'] is not None:
+        if self.module.params['jail'] is None:
+            self.jail = None
+        else:
             rc, stdout, stderr = self.execute_command('/usr/sbin/jls -j %s jid' % self.module.params['jail'])
             if rc != 0:
                 self.module.fail_json(msg="jail '%s' not found" % self.module.params['jail'], err=stderr)
