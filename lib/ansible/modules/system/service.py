@@ -67,6 +67,10 @@ options:
             - Normally it uses the value of the 'ansible_service_mgr' fact and falls back to the old 'service' module when none matching is found.
         default: auto
         version_added: 2.2
+    jail:
+        description:
+        - For FreeBSD >= 9.2 only. The jid or name of the jail to operate within.
+        version_added: "2.8"
 notes:
     - For AIX group subsystem names can be used.
     - For Windows targets, use the M(win_service) module instead.
@@ -987,8 +991,32 @@ class FreeBsdService(Service):
 
         self.sysrc_cmd = self.module.get_bin_path('sysrc')
 
+        if self.module.params['jail'] is not None:
+            rc, stdout, stderr = self.execute_command('/usr/sbin/jls -j %s jid' % self.module.params['jail'])
+            if rc != 0:
+                self.module.fail_json(msg="jail '%s' not found" % self.module.params['jail'], err=stderr)
+
+            self.jail = self.module.params['jail']
+
+            # check service(8) supports '-j' or not by osreldate.
+            rc, osreldate, stderr = self.execute_command('/sbin/sysctl -n kern.osreldate')
+            if rc != 0:
+                self.module.fail_json(msg='filed to get os version (used for "jail" option)')
+            # '-j' options is supported >= FreeBSD 11.2
+            if int(osreldate) >= 1102000:
+                self.svc_cmd_jail = "%s -j %s" % (self.svc_cmd, self.jail)
+            elif int(osreldate) < 902000 and self.state in ['enabled', 'disabled']:
+                self.module.fail_json(msg='the "jail" option is not supported for "enabled" or "disabled" state in FreeBSD older than 9.2-RELEASE')
+            else:
+                # check whether service(8) exists in jail or not
+                rc, stdout, stderr = self.module.execute_command("/usr/sbin/jexec %s %s -h" % (self.jail, self.svc_cmd))
+                if rc != 0:
+                    self.module.fail_json(msg='service command not exist in jail')
+                self.svc_cmd_jail = "/usr/sbin/jexec -j %s %s" % (self.jail, self.svc_cmd)
+            self.sysrc_cmd_jail = "%s -j %s" % (self.sysrc_cmd, self.jail)
+
     def get_service_status(self):
-        rc, stdout, stderr = self.execute_command("%s %s %s %s" % (self.svc_cmd, self.name, 'onestatus', self.arguments))
+        rc, stdout, stderr = self.execute_command("%s %s %s %s" % (self.svc_cmd_jail if self.jail else self.svc_cmd, self.name, 'onestatus', self.arguments))
         if self.name == "pf":
             self.running = "Enabled" in stdout
         else:
@@ -1008,7 +1036,9 @@ class FreeBsdService(Service):
             if os.path.isfile(rcfile):
                 self.rcconf_file = rcfile
 
-        rc, stdout, stderr = self.execute_command("%s %s %s %s" % (self.svc_cmd, self.name, 'rcvar', self.arguments))
+        svc_cmd = self.svc_cmd_jail if self.jail else self.svc_cmd
+
+        rc, stdout, stderr = self.execute_command("%s %s %s %s" % (svc_cmd, self.name, 'rcvar', self.arguments))
         try:
             rcvars = shlex.split(stdout, comments=True)
         except Exception:
@@ -1033,7 +1063,9 @@ class FreeBsdService(Service):
 
         if self.sysrc_cmd:  # FreeBSD >= 9.2
 
-            rc, current_rcconf_value, stderr = self.execute_command("%s -n %s" % (self.sysrc_cmd, self.rcconf_key))
+            sysrc_cmd = self.sysrc_cmd_jail if self.jail else self.sysrc_cmd
+
+            rc, current_rcconf_value, stderr = self.execute_command("%s -n %s" % (sysrc_cmd, self.rcconf_key))
             # it can happen that rcvar is not set (case of a system coming from the ports collection)
             # so we will fallback on the default
             if rc != 0:
@@ -1046,12 +1078,12 @@ class FreeBsdService(Service):
                 if self.module.check_mode:
                     self.module.exit_json(changed=True, msg="changing service enablement")
 
-                rc, change_stdout, change_stderr = self.execute_command("%s %s=\"%s\"" % (self.sysrc_cmd, self.rcconf_key, self.rcconf_value))
+                rc, change_stdout, change_stderr = self.execute_command("%s %s=\"%s\"" % (sysrc_cmd, self.rcconf_key, self.rcconf_value))
                 if rc != 0:
                     self.module.fail_json(msg="unable to set rcvar using sysrc", stdout=change_stdout, stderr=change_stderr)
 
                 # sysrc does not exit with code 1 on permission error => validate successful change using service(8)
-                rc, check_stdout, check_stderr = self.execute_command("%s %s %s" % (self.svc_cmd, self.name, "enabled"))
+                rc, check_stdout, check_stderr = self.execute_command("%s %s %s" % (svc_cmd, self.name, "enabled"))
                 if self.enable != (rc == 0):  # rc = 0 indicates enabled service, rc = 1 indicates disabled service
                     self.module.fail_json(msg="unable to set rcvar: sysrc did not change value", stdout=change_stdout, stderr=change_stderr)
 
@@ -1073,7 +1105,7 @@ class FreeBsdService(Service):
         if self.action == "reload":
             self.action = "onereload"
 
-        ret = self.execute_command("%s %s %s %s" % (self.svc_cmd, self.name, self.action, self.arguments))
+        ret = self.execute_command("%s %s %s %s" % (self.svc_cmd_jail if self.jail else self.svc_cmd, self.name, self.action, self.arguments))
 
         if self.sleep:
             time.sleep(self.sleep)
@@ -1575,6 +1607,7 @@ def main():
             enabled=dict(type='bool'),
             runlevel=dict(type='str', default='default'),
             arguments=dict(type='str', default='', aliases=['args']),
+            jail=dict(type='str')
         ),
         supports_check_mode=True,
         required_one_of=[['state', 'enabled']],
